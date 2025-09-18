@@ -41,7 +41,7 @@ DB_PATH = os.environ.get("YT_TG_DB", "youtube_telegram.db")
 # Telegram creds - handle empty values gracefully
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
-TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "youtube_bot")
+TELEGRAM_SESSION = os.environ.get("STRING_SESSION", "youtube_bot")
 TELEGRAM_INDEX_CHANNEL = os.environ.get("TELEGRAM_INDEX_CHANNEL", "").strip()
 TELEGRAM_UPLOAD_CHANNEL = os.environ.get("TELEGRAM_UPLOAD_CHANNEL", "").strip()
 
