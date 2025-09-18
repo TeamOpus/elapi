@@ -1,4 +1,4 @@
-# main.py - Complete Fixed Version
+# main.py - FastAPI YouTube Proxy + Telegram with persistent index.json
 import os
 import re
 import json
@@ -10,14 +10,14 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-# Load environment variables first
+# Load environment early
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -35,20 +35,21 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     Client = None
 
-# ------------- Logging -------------
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("yt-proxy-api")
+log = logging.getLogger("yt-propi")
 
-# ------------- Settings -------------
+# ---------- Settings ----------
 APP_TITLE = "YouTube Streaming Proxy + Telegram"
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.2.0"
 
-DB_PATH = os.environ.get("YT_TG_DB", "youtube_telegram.db")
+DB_PATH = os.environ.get("YT_TG_DB", "youtube_rate.db")  # only for rate limit
+INDEX_JSON_PATH = os.environ.get("INDEX_JSON_PATH", "index.json")
 
-# Telegram settings
+# Telegram env
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
-TELEGRAM_SESSION_STRING = os.environ.get("STRING_SESSION", "").strip()
+TELEGRAM_SESSION_STRING = os.environ.get("STRING__SESSION", "").strip()
 TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "youtube_api")
 TELEGRAM_INDEX_CHANNEL = os.environ.get("TELEGRAM_INDEX_CHANNEL", "").strip()
 TELEGRAM_UPLOAD_CHANNEL = os.environ.get("TELEGRAM_UPLOAD_CHANNEL", "").strip()
@@ -57,24 +58,11 @@ TELEGRAM_UPLOAD_CHANNEL = os.environ.get("TELEGRAM_UPLOAD_CHANNEL", "").strip()
 RATE_MAX = int(os.environ.get("RATE_MAX", "10000"))
 RATE_WIN = int(os.environ.get("RATE_WIN", "60"))
 
-# ------------- DB Init -------------
+# ---------- DB Init (rate-limits only) ----------
 def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS indexed_files (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          video_id TEXT UNIQUE,
-          title TEXT,
-          file_name TEXT,
-          message_id INTEGER,
-          channel_username TEXT,
-          file_size INTEGER,
-          duration INTEGER,
-          indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS rate_limits (
           ip_hash TEXT PRIMARY KEY,
@@ -84,11 +72,10 @@ def init_db():
         """)
         conn.commit()
         conn.close()
-        log.info("Database initialized successfully")
     except Exception as e:
-        log.error(f"Database init error: {e}")
+        log.error(f"DB init error: {e}")
 
-# ------------- Rate Limiter -------------
+# ---------- Rate Limiter ----------
 class RateLimiter:
     def __init__(self, max_requests: int, window_seconds: int):
         self.max_requests = max_requests
@@ -103,13 +90,19 @@ class RateLimiter:
             cur.execute("SELECT request_count, window_start FROM rate_limits WHERE ip_hash = ?", (ip_hash,))
             row = cur.fetchone()
             if not row:
-                cur.execute("INSERT INTO rate_limits (ip_hash, request_count, window_start) VALUES (?, 1, ?)", (ip_hash, now))
+                cur.execute(
+                    "INSERT INTO rate_limits (ip_hash, request_count, window_start) VALUES (?, 1, ?)",
+                    (ip_hash, now)
+                )
                 conn.commit()
                 conn.close()
                 return True
             cnt, start = row
             if now - start >= self.window_seconds:
-                cur.execute("UPDATE rate_limits SET request_count = 1, window_start = ? WHERE ip_hash = ?", (now, ip_hash))
+                cur.execute(
+                    "UPDATE rate_limits SET request_count = 1, window_start = ? WHERE ip_hash = ?",
+                    (now, ip_hash)
+                )
                 conn.commit()
                 conn.close()
                 return True
@@ -124,20 +117,98 @@ class RateLimiter:
             log.error(f"Rate limit error: {e}")
             return True
 
-# ------------- Header Rotation -------------
+# ---------- Persistent Index (index.json) ----------
+class IndexStore:
+    def __init__(self, path: str = "index.json"):
+        self.path = path
+        self.data: Dict[str, Any] = {"channels": {}, "files": {}}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+        except FileNotFoundError:
+            self.data = {"channels": {}, "files": {}}
+        except Exception as e:
+            log.error(f"index.json load failed: {e}")
+
+    def _atomic_save(self):
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp, self.path)  # atomic replace on POSIX/NT
+        except Exception as e:
+            log.error(f"index.json save failed: {e}")
+
+    def last_msg_id(self, channel: str) -> int:
+        return int(self.data.get("channels", {}).get(channel, {}).get("last_msg_id", 0))
+
+    def set_last_msg_id(self, channel: str, msg_id: int):
+        ch = self.data.setdefault("channels", {}).setdefault(channel, {})
+        if msg_id > int(ch.get("last_msg_id", 0)):
+            ch["last_msg_id"] = int(msg_id)
+            self._atomic_save()
+
+    def upsert_from_message(self, channel: str, message: Any) -> bool:
+        media = getattr(message, "audio", None) or getattr(message, "video", None) or getattr(message, "document", None)
+        if not media:
+            return False
+        file_name = getattr(media, "file_name", "") or f"file_{message.id}"
+        m = re.search(r"([A-Za-z0-9_-]{11})", file_name)
+        video_id = m.group(1) if m else None
+        if not video_id:
+            return False
+        entry = {
+            "video_id": video_id,
+            "title": message.caption or file_name,
+            "file_name": file_name,
+            "message_id": int(message.id),
+            "channel_username": channel,
+            "file_size": int(getattr(media, "file_size", 0) or 0),
+            "duration": int(getattr(media, "duration", 0) or 0),
+        }
+        self.data.setdefault("files", {})[video_id] = entry
+        self.set_last_msg_id(channel, int(message.id))
+        self._atomic_save()
+        return True
+
+    def get_link(self, video_id: str) -> Optional[str]:
+        entry = self.data.get("files", {}).get(video_id)
+        if entry:
+            return f"https://t.me/{entry['channel_username']}/{entry['message_id']}"
+        return None
+
+    def get_meta(self, video_id: str) -> Optional[Dict[str, Any]]:
+        return self.data.get("files", {}).get(video_id)
+
+    def search(self, q: str) -> List[Dict[str, Any]]:
+        ql = q.lower()
+        out: List[Dict[str, Any]] = []
+        for v in self.data.get("files", {}).values():
+            if ql in v.get("title", "").lower() or ql in v.get("file_name", "").lower():
+                out.append({
+                    "video_id": v["video_id"],
+                    "title": v["title"],
+                    "file_name": v["file_name"],
+                    "telegram_url": f"https://t.me/{v['channel_username']}/{v['message_id']}",
+                    "file_size": v["file_size"],
+                    "duration": v["duration"],
+                })
+        # newest first by message_id
+        out.sort(key=lambda r: int(r["telegram_url"].split("/")[-1]), reverse=True)
+        return out
+
+index_store = IndexStore(INDEX_JSON_PATH)
+
+# ---------- Header Rotation ----------
 class HeaderManager:
     def __init__(self):
         self.browser_headers = [
             {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive"
-            },
-            {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive"
@@ -153,10 +224,6 @@ class HeaderManager:
             }
         ]
 
-    def pick_browser(self) -> Dict[str, str]:
-        import random
-        return random.choice(self.browser_headers).copy()
-
     def pick_video(self) -> Dict[str, str]:
         import random
         return random.choice(self.video_headers).copy()
@@ -169,7 +236,7 @@ class HeaderManager:
             "Pragma": "no-cache"
         }
 
-# ------------- Proxy Manager -------------
+# ---------- Proxy Manager ----------
 class ProxyManager:
     def __init__(self):
         self._proxies: List[str] = []
@@ -186,7 +253,7 @@ class ProxyManager:
         self._idx += 1
         return p
 
-# ------------- YouTube API client -------------
+# ---------- YouTube API client ----------
 class YouTubeAPI:
     def __init__(self):
         self.api_url = "https://utdqxiuahh.execute-api.ap-south-1.amazonaws.com/pro/fetch"
@@ -208,7 +275,6 @@ class YouTubeAPI:
             match = re.search(pattern, inp)
             if match:
                 return match.group(1)
-        # Check if it's already a video ID
         if re.fullmatch(r"[A-Za-z0-9_-]{11}", inp):
             return inp
         return None
@@ -217,13 +283,11 @@ class YouTubeAPI:
         vid = self.extract_video_id(video_or_url)
         if not vid:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL or video_id")
-        
         yt_url = f"https://music.youtube.com/watch?v={vid}"
-        
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0), 
-                headers=self.headers, 
+                timeout=httpx.Timeout(30.0),
+                headers=self.headers,
                 follow_redirects=True
             ) as client:
                 response = await client.get(self.api_url, params={"url": yt_url, "user_id": "h2"})
@@ -238,7 +302,7 @@ class YouTubeAPI:
             log.error(f"YouTube API error: {e}")
             raise HTTPException(status_code=500, detail="YouTube API unavailable")
 
-# ------------- Telegram Manager -------------
+# ---------- Telegram Manager ----------
 class TelegramManager:
     def __init__(self):
         self.client: Optional[Client] = None
@@ -250,40 +314,20 @@ class TelegramManager:
         if not TELEGRAM_AVAILABLE:
             log.warning("Pyrogram not installed. Telegram features disabled.")
             return
-            
         if not (TELEGRAM_API_ID and TELEGRAM_API_HASH):
             log.warning("Telegram credentials not set. Telegram features disabled.")
-            log.info("Set TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables.")
             return
-            
         try:
-            # Handle API ID
             api_id_val = int(TELEGRAM_API_ID) if TELEGRAM_API_ID.isdigit() else TELEGRAM_API_ID
-            
-            # Build client arguments
-            client_kwargs = {
-                "name": TELEGRAM_SESSION,
-                "api_id": api_id_val,
-                "api_hash": TELEGRAM_API_HASH
-            }
-            
-            # Use session string if provided
+            kwargs = {"name": TELEGRAM_SESSION, "api_id": api_id_val, "api_hash": TELEGRAM_API_HASH}
             if TELEGRAM_SESSION_STRING:
-                client_kwargs["session_string"] = TELEGRAM_SESSION_STRING
-                log.info("Using Telegram session string")
-            else:
-                log.info("Using Telegram session file")
-            
-            self.client = Client(**client_kwargs)
+                kwargs["session_string"] = TELEGRAM_SESSION_STRING
+            self.client = Client(**kwargs)
             await self.client.start()
             self.enabled = True
-            log.info("Telegram client started successfully")
-            
-            # Index channel if specified
+            log.info("Telegram client started")
             if self.index_channel:
-                log.info(f"Starting to index channel: {self.index_channel}")
                 await self.index_channel_files(self.index_channel)
-                
         except Exception as e:
             log.error(f"Telegram startup failed: {e}")
             self.enabled = False
@@ -292,7 +336,6 @@ class TelegramManager:
         if self.client:
             try:
                 await self.client.stop()
-                log.info("Telegram client stopped")
             except Exception as e:
                 log.error(f"Telegram stop error: {e}")
 
@@ -300,92 +343,33 @@ class TelegramManager:
         if not (self.enabled and self.client):
             return
         try:
-            count = 0
+            last_id = index_store.last_msg_id(channel_username)
+            processed = 0
+            # Newest first; stop when we reach already indexed boundary
             async for msg in self.client.get_chat_history(channel_username):
-                await self._index_message(channel_username, msg)
-                count += 1
-                if count % 100 == 0:
-                    log.info(f"Indexed {count} messages from {channel_username}...")
-                await asyncio.sleep(0.1)
-            log.info(f"Finished indexing {count} messages from {channel_username}")
+                if last_id and int(msg.id) <= last_id:
+                    break
+                index_store.upsert_from_message(channel_username, msg)
+                processed += 1
+                if processed % 100 == 0:
+                    log.info(f"Indexed {processed} new messages for {channel_username}")
+                await asyncio.sleep(0.05)
+            if processed:
+                log.info(f"Indexed {processed} new items for {channel_username}")
         except FloodWait as e:
             log.warning(f"FloodWait: sleeping {e.value}s")
             await asyncio.sleep(e.value)
             await self.index_channel_files(channel_username)
         except Exception as e:
-            log.error(f"Channel indexing error: {e}")
-
-    async def _index_message(self, channel_username: str, msg: Message):
-        try:
-            media = msg.audio or msg.video or msg.document
-            if not media:
-                return
-            
-            file_name = getattr(media, "file_name", "") or f"file_{msg.id}"
-            match = re.search(r"([A-Za-z0-9_-]{11})", file_name)
-            video_id = match.group(1) if match else None
-            
-            if not video_id:
-                return
-                
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("""
-            INSERT OR REPLACE INTO indexed_files 
-            (video_id, title, file_name, message_id, channel_username, file_size, duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                video_id,
-                msg.caption or file_name,
-                file_name,
-                msg.id,
-                channel_username,
-                getattr(media, "file_size", 0),
-                getattr(media, "duration", 0)
-            ))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            log.error(f"Message indexing error: {e}")
+            log.error(f"Incremental indexing error: {e}")
 
     async def get_link(self, video_id: str) -> Optional[str]:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT message_id, channel_username FROM indexed_files WHERE video_id = ?", (video_id,))
-            row = cur.fetchone()
-            conn.close()
-            if row:
-                mid, ch = row
-                return f"https://t.me/{ch}/{mid}"
-        except Exception as e:
-            log.error(f"Get link error: {e}")
-        return None
+        return index_store.get_link(video_id)
 
     async def search(self, q: str) -> List[Dict[str, Any]]:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("""
-            SELECT video_id, title, file_name, message_id, channel_username, file_size, duration
-            FROM indexed_files WHERE title LIKE ? OR file_name LIKE ?
-            ORDER BY indexed_at DESC LIMIT 50
-            """, (f"%{q}%", f"%{q}%"))
-            rows = cur.fetchall()
-            conn.close()
-            return [{
-                "video_id": r[0],
-                "title": r[1],
-                "file_name": r[2],
-                "telegram_url": f"<https://t.me/{r>[4]}/{r[3]}",
-                "file_size": r[5],
-                "duration": r[6]
-            } for r in rows]
-        except Exception as e:
-            log.error(f"Search error: {e}")
-            return []
+        return index_store.search(q)
 
-# ------------- Models -------------
+# ---------- Models ----------
 class VideoResponse(BaseModel):
     statusCode: int
     url: str
@@ -401,36 +385,105 @@ class SearchResponse(BaseModel):
     results: List[Dict[str, Any]]
     total: int
 
-# ------------- Singletons -------------
+# ---------- Utilities ----------
 rate_limiter = RateLimiter(RATE_MAX, RATE_WIN)
 headers_mgr = HeaderManager()
 proxy_mgr = ProxyManager()
 yt_api = YouTubeAPI()
 tg_mgr = TelegramManager()
 
+def sanitize_filename(s: str, ext: str) -> str:
+    base = re.sub(r"[^\w\s.-]", "", s).strip().replace(" ", "_")[:80] or "video"
+    return f"{base}.{ext}"
+
+def get_media_type(ext: str) -> str:
+    mime = {
+        "mp4": "video/mp4",
+        "webm": "video/webm",
+        "m4a": "audio/mp4",
+        "mp3": "audio/mpeg",
+        "aac": "audio/aac",
+        "ogg": "audio/ogg",
+    }
+    return mime.get(ext.lower(), "application/octet-stream")
+
+async def proxy_stream_media(
+    request: Request,
+    upstream_url: str,
+    ext: str,
+    filename: Optional[str] = None,
+    force_download: bool = False
+):
+    # Forward Range for seeking
+    range_header = request.headers.get("range")
+    vid_headers = headers_mgr.pick_video()
+    if range_header:
+        vid_headers["Range"] = range_header
+
+    proxy = proxy_mgr.pick()
+    client_kwargs = {
+        "timeout": httpx.Timeout(60.0),
+        "headers": vid_headers,
+        "follow_redirects": True
+    }
+    if proxy:
+        client_kwargs["proxy"] = proxy
+
+    # Single stream: open upstream to get headers and then yield bytes
+    client = httpx.AsyncClient(**client_kwargs)
+    try:
+        response = await client.stream("GET", upstream_url)
+        if response.status_code not in (200, 206):
+            await response.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=response.status_code, detail="Upstream unavailable")
+
+        # Build downstream headers from upstream headers
+        response_headers = {"Accept-Ranges": "bytes"}
+        if "Content-Length" in response.headers:
+            response_headers["Content-Length"] = response.headers["Content-Length"]
+        if "Content-Range" in response.headers:
+            response_headers["Content-Range"] = response.headers["Content-Range"]
+        status_code = 206 if response.status_code == 206 else 200
+
+        media_type = response.headers.get("Content-Type", get_media_type(ext))
+        if force_download:
+            fname = filename or sanitize_filename("download", ext)
+            response_headers.update(headers_mgr.download_headers(fname))
+            media_type = "application/octet-stream"
+
+        async def gen():
+            try:
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    yield chunk
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        return StreamingResponse(gen(), media_type=media_type, headers=response_headers, status_code=status_code)
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        log.error(f"Stream setup error: {e}")
+        raise HTTPException(status_code=500, detail="Media stream unavailable")
+
+# ---------- Lifespan ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        init_db()
-        await tg_mgr.start()
-        log.info("Application started successfully")
-        yield
-    except Exception as e:
-        log.error(f"Startup error: {e}")
-        yield
-    finally:
-        await tg_mgr.stop()
+    init_db()
+    await tg_mgr.start()
+    yield
+    await tg_mgr.stop()
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_methods=["*"], 
-    allow_headers=["*"], 
-    allow_credentials=True
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
-# ------------- Middleware -------------
+# ---------- Middleware ----------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     ip = request.client.host if request.client else "0.0.0.0"
@@ -438,159 +491,42 @@ async def rate_limit_middleware(request: Request, call_next):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     return await call_next(request)
 
-# ------------- Helpers -------------
-def sanitize_filename(s: str, ext: str) -> str:
-    base = re.sub(r"[^\w\s.-]", "", s).strip().replace(" ", "_")[:80] or "video"
-    return f"{base}.{ext}"
-
-def get_media_type(ext: str) -> str:
-    """Get proper MIME type for media files"""
-    mime_types = {
-        'mp4': 'video/mp4',
-        'webm': 'video/webm',
-        'm4a': 'audio/mp4',
-        'mp3': 'audio/mpeg',
-        'aac': 'audio/aac',
-        'ogg': 'audio/ogg'
-    }
-    return mime_types.get(ext.lower(), 'application/octet-stream')
-
-async def proxy_stream_media(
-    request: Request, 
-    upstream_url: str, 
-    ext: str, 
-    filename: Optional[str] = None, 
-    force_download: bool = False
-):
-    """
-    Proxy media stream from YouTube through this server
-    - Streaming: Browser plays the media directly (video/webm, audio/mp4, etc.)
-    - Download: Browser downloads the file (Content-Disposition: attachment)
-    """
-    
-    # Get client range header for seeking support
-    range_header = request.headers.get("range")
-    vid_headers = headers_mgr.pick_video()
-    if range_header:
-        vid_headers["Range"] = range_header
-
-    # Get proxy if available
-    proxy = proxy_mgr.pick()
-    
-    # FIXED: Proper httpx.Timeout configuration
-    client_kwargs = {
-        "timeout": httpx.Timeout(timeout=60.0),  # Set default timeout
-        "headers": vid_headers,
-        "follow_redirects": True
-    }
-    
-    if proxy:
-        client_kwargs["proxy"] = proxy
-        log.info(f"Using proxy: {proxy}")
-
-    async def stream_generator():
-        """Safe generator that doesn't raise exceptions after streaming starts"""
-        try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                async with client.stream("GET", upstream_url) as response:
-                    if response.status_code not in (200, 206):
-                        log.error(f"Upstream error: {response.status_code}")
-                        return
-                    
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        yield chunk
-        except Exception as e:
-            log.error(f"Stream error: {e}")
-            return
-
-    try:
-        # Get response info first
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            head_response = await client.head(upstream_url, headers=vid_headers)
-            
-            # Build response headers
-            response_headers = {"Accept-Ranges": "bytes"}
-            
-            # Copy relevant headers from upstream
-            if "Content-Length" in head_response.headers:
-                response_headers["Content-Length"] = head_response.headers["Content-Length"]
-            if "Content-Range" in head_response.headers:
-                response_headers["Content-Range"] = head_response.headers["Content-Range"]
-            
-            # Determine status code
-            status_code = 206 if head_response.status_code == 206 else 200
-            
-            # Set media type
-            media_type = get_media_type(ext)
-            
-            # Handle download vs streaming
-            if force_download:
-                fname = filename or sanitize_filename("download", ext)
-                response_headers.update(headers_mgr.download_headers(fname))
-                media_type = "application/octet-stream"  # Force download
-                log.info(f"Serving download: {fname}")
-            else:
-                log.info(f"Streaming {media_type}: {ext}")
-            
-            return StreamingResponse(
-                stream_generator(),
-                media_type=media_type,
-                headers=response_headers,
-                status_code=status_code
-            )
-            
-    except Exception as e:
-        log.error(f"Stream setup error: {e}")
-        raise HTTPException(status_code=500, detail="Media stream unavailable")
-
-# ------------- Routes -------------
+# ---------- Endpoints ----------
 @app.get("/")
 async def root():
     return {
         "name": APP_TITLE,
         "version": APP_VERSION,
         "telegram_enabled": tg_mgr.enabled,
+        "index_file": INDEX_JSON_PATH,
         "endpoints": {
-            "/extract": "Get video info (Telegram link priority)",
-            "/stream/{video_id}": "🎥 Stream video via this server (browser plays)",
-            "/download/{video_id}/{format_id}": "📥 Download file via this server (forces save)",
-            "/search": "🔍 Search indexed Telegram files",
-            "/telegram/{video_id}": "📱 Get Telegram link if available",
-            "/formats": "📋 List all available formats",
-            "/proxy/add": "🔧 Add HTTP/SOCKS5 proxy",
-            "/stats": "📊 API statistics"
-        },
-        "behavior": {
-            "streaming": "Serves media for browser playback (MP4, WebM, M4A, MP3)",
-            "download": "Forces file download with proper filename",
-            "telegram_priority": "Returns Telegram link if video exists in indexed channel"
+            "/extract": "Get video info (Telegram first)",
+            "/formats": "List formats",
+            "/stream/{video_id}": "Stream via this server",
+            "/download/{video_id}/{format_id}": "Force download via this server",
+            "/telegram/{video_id}": "Get Telegram link if indexed",
+            "/search": "Search indexed Telegram files",
+            "/index-new": "Index only new Telegram messages",
+            "/proxy/add": "Add proxy",
+            "/stats": "Stats"
         }
     }
 
 @app.get("/extract", response_model=VideoResponse)
 async def extract(url: Optional[str] = None, video_id: Optional[str] = None):
-    """Extract video information - Returns Telegram link if available, otherwise YouTube data"""
     inp = url or video_id
     if not inp:
-        raise HTTPException(status_code=400, detail="Provide url or video_id parameter")
-    
+        raise HTTPException(status_code=400, detail="Provide url or video_id")
     vid = yt_api.extract_video_id(inp)
     if not vid:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL or video_id")
 
-    # 🔥 Priority 1: Check Telegram first
-    telegram_link = await tg_mgr.get_link(vid)
-    if telegram_link:
-        # Return Telegram-based response
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT title, duration FROM indexed_files WHERE video_id = ?", (vid,))
-        row = cur.fetchone()
-        conn.close()
-        
-        title = row[0] if row else f"Video {vid}"
-        duration = row[1] if row else 0
-        
+    # Telegram priority via JSON index
+    tglink = await tg_mgr.get_link(vid)
+    if tglink:
+        meta = index_store.get_meta(vid)
+        title = meta["title"] if meta else vid
+        duration = int(meta["duration"]) if meta else 0
         return VideoResponse(
             statusCode=200,
             url=f"https://youtube.com/watch?v={vid}",
@@ -598,55 +534,39 @@ async def extract(url: Optional[str] = None, video_id: Optional[str] = None):
             thumbnail=f"https://i.ytimg.com/vi/{vid}/hq720.jpg",
             duration=duration or 0,
             video_id=vid,
-            telegram_link=telegram_link,
+            telegram_link=tglink,
             medias=[],
             source="telegram"
         )
 
-    # 🎵 Priority 2: Get from YouTube API
     data = await yt_api.get_info(inp)
     data["telegram_link"] = None
     data["source"] = "youtube"
-    
     return VideoResponse(**data)
 
 @app.get("/formats")
 async def get_formats(url: Optional[str] = None, video_id: Optional[str] = None):
-    """List all available formats organized by type and quality"""
     inp = url or video_id
     if not inp:
-        raise HTTPException(status_code=400, detail="Provide url or video_id parameter")
-    
+        raise HTTPException(status_code=400, detail="Provide url or video_id")
     data = await yt_api.get_info(inp)
-    
-    # Organize formats
-    organized = {
-        "video": {},
-        "audio": [],
-        "combined": []
-    }
-    
+    organized = {"video": {}, "audio": [], "combined": []}
     for media in data.get("medias", []):
-        format_info = {
+        info = {
             "formatId": media.get("formatId"),
             "ext": media.get("ext"),
             "quality": media.get("quality"),
             "bitrate": media.get("bitrate"),
-            "size": media.get("file_size"),
             "stream_url": f"/stream/{data['video_id']}?format_id={media.get('formatId')}",
             "download_url": f"/download/{data['video_id']}/{media.get('formatId')}"
         }
-        
         if media.get("is_audio"):
-            organized["audio"].append(format_info)
-        elif media.get("type") == "video" and not media.get("is_audio"):
-            quality = media.get("label", "unknown")
-            if quality not in organized["video"]:
-                organized["video"][quality] = []
-            organized["video"][quality].append(format_info)
+            organized["audio"].append(info)
+        elif media.get("type") == "video":
+            label = media.get("label", "unknown")
+            organized["video"].setdefault(label, []).append(info)
         else:
-            organized["combined"].append(format_info)
-    
+            organized["combined"].append(info)
     return {
         "video_id": data.get("video_id"),
         "title": data.get("title"),
@@ -658,106 +578,55 @@ async def get_formats(url: Optional[str] = None, video_id: Optional[str] = None)
 async def stream_video(
     request: Request,
     video_id: str,
-    quality: str = Query("720p", description="Video quality (240p, 360p, 480p, 720p, 1080p)"),
-    format_type: str = Query("mp4", description="Format (mp4, webm, m4a)"),
-    format_id: Optional[int] = Query(None, description="Specific format ID"),
-    download: bool = Query(False, description="Force download instead of streaming")
+    quality: str = Query("720p"),
+    format_type: str = Query("mp4"),
+    format_id: Optional[int] = Query(None),
+    download: bool = Query(False)
 ):
-    """
-    🎥 Stream video through this server
-    - Returns: Video/audio stream for browser playback
-    - Supports: Range requests for seeking
-    - Priority: Telegram link > YouTube stream
-    """
-    
-    # Check Telegram first
-    telegram_link = await tg_mgr.get_link(video_id)
-    if telegram_link:
-        return RedirectResponse(url=telegram_link)
+    tglink = await tg_mgr.get_link(video_id)
+    if tglink:
+        return RedirectResponse(url=tglink)
 
-    # Get video data
     data = await yt_api.get_info(video_id)
     medias = data.get("medias", [])
-    
-    # Find matching format
-    if format_id:
-        # Specific format requested
+    if format_id is not None:
         chosen = next((m for m in medias if m.get("formatId") == format_id), None)
     else:
-        # Quality-based selection
-        candidates = [
-            m for m in medias 
-            if quality.lower() in m.get("label", "").lower() 
+        cands = [
+            m for m in medias
+            if quality.lower() in m.get("label", "").lower()
             and format_type.lower() in m.get("ext", "").lower()
         ]
-        if not candidates:
-            # Fallback to quality only
-            candidates = [m for m in medias if quality.lower() in m.get("label", "").lower()]
-        chosen = candidates[0] if candidates else None
-    
+        if not cands:
+            cands = [m for m in medias if quality.lower() in m.get("label", "").lower()]
+        chosen = cands[0] if cands else None
     if not chosen:
         raise HTTPException(status_code=404, detail=f"No suitable format found for {quality} {format_type}")
-
-    # Stream the media
     ext = chosen.get("ext", "mp4")
     title = data.get("title", video_id)
     filename = sanitize_filename(f"{title}_{video_id}", ext)
-    
-    return await proxy_stream_media(
-        request=request,
-        upstream_url=chosen["url"],
-        ext=ext,
-        filename=filename,
-        force_download=download
-    )
+    return await proxy_stream_media(request, chosen["url"], ext, filename, force_download=bool(download))
 
 @app.get("/download/{video_id}/{format_id}")
 async def download_video(
-    request: Request, 
-    video_id: str, 
+    request: Request,
+    video_id: str,
     format_id: int,
-    filename: Optional[str] = Query(None, description="Custom filename")
+    filename: Optional[str] = Query(None)
 ):
-    """
-    📥 Download video file through this server
-    - Returns: File download (Content-Disposition: attachment)
-    - Priority: Telegram link > YouTube download
-    """
-    
-    # Check Telegram first
-    telegram_link = await tg_mgr.get_link(video_id)
-    if telegram_link:
-        return RedirectResponse(url=telegram_link)
-
-    # Get video data
+    tglink = await tg_mgr.get_link(video_id)
+    if tglink:
+        return RedirectResponse(url=tglink)
     data = await yt_api.get_info(video_id)
-    
-    # Find specific format
-    chosen = next(
-        (m for m in data.get("medias", []) if m.get("formatId") == format_id), 
-        None
-    )
-    
+    chosen = next((m for m in data.get("medias", []) if m.get("formatId") == format_id), None)
     if not chosen:
         raise HTTPException(status_code=404, detail=f"Format ID {format_id} not found")
-    
-    # Generate filename
     ext = chosen.get("ext", "mp4")
-    if not filename:
-        title = data.get("title", video_id)
-        filename = sanitize_filename(f"{title}_{video_id}", ext)
-    
-    return await proxy_stream_media(
-        request=request,
-        upstream_url=chosen["url"],
-        ext=ext,
-        filename=filename,
-        force_download=True  # Force download
-    )
+    name = filename or sanitize_filename(f"{data.get('title', video_id)}_{video_id}", ext)
+    return await proxy_stream_media(request, chosen["url"], ext, name, force_download=True)
 
 @app.get("/telegram/{video_id}")
 async def get_telegram_link(video_id: str):
-    """Get Telegram link for a video ID if it exists in indexed files"""
     link = await tg_mgr.get_link(video_id)
     if not link:
         raise HTTPException(status_code=404, detail="Video not found in Telegram index")
@@ -765,52 +634,51 @@ async def get_telegram_link(video_id: str):
 
 @app.get("/search", response_model=SearchResponse)
 async def search_files(q: str = Query(..., description="Search query")):
-    """Search indexed Telegram files by title or filename"""
     results = await tg_mgr.search(q)
     return SearchResponse(results=results, total=len(results))
 
+@app.post("/index-new")
+async def index_new(channel: Optional[str] = Query(None, description="Channel username")):
+    if not tg_mgr.enabled:
+        raise HTTPException(status_code=503, detail="Telegram disabled")
+    ch = channel or tg_mgr.index_channel
+    if not ch:
+        raise HTTPException(status_code=400, detail="No channel configured")
+    await tg_mgr.index_channel_files(ch)
+    return {
+        "channel": ch,
+        "last_msg_id": index_store.last_msg_id(ch),
+        "total_indexed": len(index_store.data.get("files", {}))
+    }
+
 @app.post("/proxy/add")
-async def add_proxy(proxy_url: str = Query(..., description="Proxy URL (http:// or socks5://)")):
-    """Add HTTP or SOCKS5 proxy for rotation"""
+async def add_proxy(proxy_url: str = Query(..., description="http://... or socks5://...")):
     proxy_mgr.add(proxy_url)
-    return {"message": f"Added proxy: {proxy_url}", "total_proxies": len(proxy_mgr._proxies)}
+    return {"message": f"Added proxy: {proxy_url}", "count": len(proxy_mgr._proxies)}
 
 @app.get("/proxy/status")
 async def proxy_status():
-    """Get proxy configuration status"""
-    return {
-        "total_proxies": len(proxy_mgr._proxies),
-        "current_index": proxy_mgr._idx,
-        "telegram_enabled": tg_mgr.enabled,
-        "indexed_channel": tg_mgr.index_channel or "Not set"
-    }
+    return {"proxies": len(proxy_mgr._proxies), "current_index": proxy_mgr._idx}
 
 @app.get("/stats")
-async def get_stats():
-    """API statistics and configuration"""
+async def stats():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM indexed_files")
-        total_files = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM rate_limits")
         total_ips = cur.fetchone()[0]
         conn.close()
-        
-        return {
-            "version": APP_VERSION,
-            "telegram_enabled": tg_mgr.enabled,
-            "indexed_files": total_files,
-            "unique_ips": total_ips,
-            "rate_limit": f"{RATE_MAX} requests per {RATE_WIN} seconds",
-            "proxies": len(proxy_mgr._proxies),
-            "index_channel": tg_mgr.index_channel or "Not set",
-            "upload_channel": tg_mgr.upload_channel or "Not set"
-        }
-    except Exception as e:
-        return {"error": str(e), "version": APP_VERSION}
+    except Exception:
+        total_ips = 0
+    return {
+        "version": APP_VERSION,
+        "telegram_enabled": tg_mgr.enabled,
+        "indexed_files": len(index_store.data.get("files", {})),
+        "channels": list(index_store.data.get("channels", {}).keys()),
+        "rate_limit": f"{RATE_MAX}/{RATE_WIN}s",
+        "unique_ips": total_ips
+    }
 
-# ------------- Error Handlers -------------
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
     return JSONResponse(status_code=404, content={"error": "Endpoint not found"})
@@ -822,10 +690,4 @@ async def internal_error_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app", 
-        host="72.60.108.92", 
-        port=int(os.environ.get("PORT", "8000")), 
-        reload=False,
-        log_level="info"
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=False)
