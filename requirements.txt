@@ -1,0 +1,13 @@
+# Web framework and server
+fastapi>=0.112,<1
+uvicorn[standard]>=0.30,<1
+
+# HTTP client with SOCKS support (enable proxies)
+httpx[socks]>=0.27,<1
+
+# Telegram client and speedups
+pyrogram>=2.0,<3
+tgcrypto>=1.2,<2
+
+# Data validation (FastAPI uses Pydantic v2)
+pydantic>=2.7,<3
