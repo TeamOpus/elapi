@@ -1,4 +1,4 @@
-# main.py - FastAPI YouTube Proxy + Telegram with persistent index.json
+# main.py — FastAPI YouTube proxy + Telegram (user session) with persistent index.json
 import os
 import re
 import json
@@ -7,58 +7,62 @@ import asyncio
 import hashlib
 import logging
 import sqlite3
-from pathlib import Path
 from typing import Optional, List, Dict, Any
+from contextlib import asynccontextmanager
 
-# Load environment early
+# Load .env early so env vars are available to os.environ
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:
+except Exception:
     pass
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from contextlib import asynccontextmanager
 
 import httpx
 
-# Optional Telegram imports
+# Telegram (user session only; no bot token)
 try:
     from pyrogram import Client
     from pyrogram.types import Message
     from pyrogram.errors import FloodWait
     TELEGRAM_AVAILABLE = True
-except ImportError:
+except Exception:
     TELEGRAM_AVAILABLE = False
     Client = None
+    Message = None
+    FloodWait = Exception
 
-# ---------- Logging ----------
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("yt-propi")
+log = logging.getLogger("yt-proxy-api")
 
-# ---------- Settings ----------
+# ---------------- Settings ----------------
 APP_TITLE = "YouTube Streaming Proxy + Telegram"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
-DB_PATH = os.environ.get("YT_TG_DB", "youtube_rate.db")  # only for rate limit
+# Rate-limit DB (SQLite only for rate limits)
+DB_PATH = os.environ.get("YT_TG_DB", "youtube_rate.db")
+
+# Persistent JSON index
 INDEX_JSON_PATH = os.environ.get("INDEX_JSON_PATH", "index.json")
 
-# Telegram env
+# Telegram user-session env
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
-TELEGRAM_SESSION_STRING = os.environ.get("STRING__SESSION", "").strip()
-TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "youtube_api")
-TELEGRAM_INDEX_CHANNEL = os.environ.get("TELEGRAM_INDEX_CHANNEL", "").strip()
-TELEGRAM_UPLOAD_CHANNEL = os.environ.get("TELEGRAM_UPLOAD_CHANNEL", "").strip()
+TELEGRAM_SESSION_STRING = os.environ.get("STRING_SESSION", "").strip()  # exported string session
+TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "youtube_user")            # file-name label
+TELEGRAM_INDEX_CHANNEL = os.environ.get("TELEGRAM_INDEX_CHANNEL", "").strip()    # e.g. 
+TELEGRAM_UPLOAD_CHANNEL = os.environ.get("TELEGRAM_UPLOAD_CHANNEL", "").strip()  # optional, unused here
 
 # Rate limit settings
 RATE_MAX = int(os.environ.get("RATE_MAX", "10000"))
 RATE_WIN = int(os.environ.get("RATE_WIN", "60"))
 
-# ---------- DB Init (rate-limits only) ----------
+# ---------------- DB Init (rate-limits only) ----------------
 def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -75,7 +79,7 @@ def init_db():
     except Exception as e:
         log.error(f"DB init error: {e}")
 
-# ---------- Rate Limiter ----------
+# ---------------- Rate Limiter ----------------
 class RateLimiter:
     def __init__(self, max_requests: int, window_seconds: int):
         self.max_requests = max_requests
@@ -90,19 +94,13 @@ class RateLimiter:
             cur.execute("SELECT request_count, window_start FROM rate_limits WHERE ip_hash = ?", (ip_hash,))
             row = cur.fetchone()
             if not row:
-                cur.execute(
-                    "INSERT INTO rate_limits (ip_hash, request_count, window_start) VALUES (?, 1, ?)",
-                    (ip_hash, now)
-                )
+                cur.execute("INSERT INTO rate_limits (ip_hash, request_count, window_start) VALUES (?, 1, ?)", (ip_hash, now))
                 conn.commit()
                 conn.close()
                 return True
             cnt, start = row
             if now - start >= self.window_seconds:
-                cur.execute(
-                    "UPDATE rate_limits SET request_count = 1, window_start = ? WHERE ip_hash = ?",
-                    (now, ip_hash)
-                )
+                cur.execute("UPDATE rate_limits SET request_count = 1, window_start = ? WHERE ip_hash = ?", (now, ip_hash))
                 conn.commit()
                 conn.close()
                 return True
@@ -117,7 +115,7 @@ class RateLimiter:
             log.error(f"Rate limit error: {e}")
             return True
 
-# ---------- Persistent Index (index.json) ----------
+# ---------------- Persistent Index (index.json) ----------------
 class IndexStore:
     def __init__(self, path: str = "index.json"):
         self.path = path
@@ -138,7 +136,7 @@ class IndexStore:
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, self.path)  # atomic replace on POSIX/NT
+            os.replace(tmp, self.path)  # atomic replacement
         except Exception as e:
             log.error(f"index.json save failed: {e}")
 
@@ -175,9 +173,9 @@ class IndexStore:
         return True
 
     def get_link(self, video_id: str) -> Optional[str]:
-        entry = self.data.get("files", {}).get(video_id)
-        if entry:
-            return f"https://t.me/{entry['channel_username']}/{entry['message_id']}"
+        v = self.data.get("files", {}).get(video_id)
+        if v:
+            return f"https://t.me/{v['channel_username']}/{v['message_id']}"
         return None
 
     def get_meta(self, video_id: str) -> Optional[Dict[str, Any]]:
@@ -194,26 +192,17 @@ class IndexStore:
                     "file_name": v["file_name"],
                     "telegram_url": f"https://t.me/{v['channel_username']}/{v['message_id']}",
                     "file_size": v["file_size"],
-                    "duration": v["duration"],
+                    "duration": v["duration"]
                 })
-        # newest first by message_id
+        # newest first by message id
         out.sort(key=lambda r: int(r["telegram_url"].split("/")[-1]), reverse=True)
         return out
 
 index_store = IndexStore(INDEX_JSON_PATH)
 
-# ---------- Header Rotation ----------
+# ---------------- Headers & Proxies ----------------
 class HeaderManager:
     def __init__(self):
-        self.browser_headers = [
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive"
-            }
-        ]
         self.video_headers = [
             {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
@@ -236,7 +225,6 @@ class HeaderManager:
             "Pragma": "no-cache"
         }
 
-# ---------- Proxy Manager ----------
 class ProxyManager:
     def __init__(self):
         self._proxies: List[str] = []
@@ -253,7 +241,7 @@ class ProxyManager:
         self._idx += 1
         return p
 
-# ---------- YouTube API client ----------
+# ---------------- YouTube API Client ----------------
 class YouTubeAPI:
     def __init__(self):
         self.api_url = "https://utdqxiuahh.execute-api.ap-south-1.amazonaws.com/pro/fetch"
@@ -267,14 +255,14 @@ class YouTubeAPI:
     def extract_video_id(inp: str) -> Optional[str]:
         if not inp:
             return None
-        patterns = [
+        pats = [
             r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([^&\n?#]+)",
             r"music\.youtube\.com/watch\?v=([^&\n?#]+)"
         ]
-        for pattern in patterns:
-            match = re.search(pattern, inp)
-            if match:
-                return match.group(1)
+        for p in pats:
+            m = re.search(p, inp)
+            if m:
+                return m.group(1)
         if re.fullmatch(r"[A-Za-z0-9_-]{11}", inp):
             return inp
         return None
@@ -290,10 +278,10 @@ class YouTubeAPI:
                 headers=self.headers,
                 follow_redirects=True
             ) as client:
-                response = await client.get(self.api_url, params={"url": yt_url, "user_id": "h2"})
-                if response.status_code != 200:
-                    raise HTTPException(status_code=response.status_code, detail="YouTube API error")
-                data = response.json()
+                r = await client.get(self.api_url, params={"url": yt_url, "user_id": "h2"})
+                if r.status_code != 200:
+                    raise HTTPException(status_code=r.status_code, detail="YouTube API error")
+                data = r.json()
                 data["video_id"] = vid
                 return data
         except httpx.TimeoutException:
@@ -302,34 +290,33 @@ class YouTubeAPI:
             log.error(f"YouTube API error: {e}")
             raise HTTPException(status_code=500, detail="YouTube API unavailable")
 
-# ---------- Telegram Manager ----------
+# ---------------- Telegram (User Session) ----------------
 class TelegramManager:
     def __init__(self):
         self.client: Optional[Client] = None
         self.enabled = False
         self.index_channel = TELEGRAM_INDEX_CHANNEL
-        self.upload_channel = TELEGRAM_UPLOAD_CHANNEL
 
     async def start(self):
         if not TELEGRAM_AVAILABLE:
-            log.warning("Pyrogram not installed. Telegram features disabled.")
+            log.warning("Pyrogram not installed; Telegram disabled.")
             return
         if not (TELEGRAM_API_ID and TELEGRAM_API_HASH):
-            log.warning("Telegram credentials not set. Telegram features disabled.")
+            log.warning("Telegram API creds missing; Telegram disabled.")
             return
         try:
             api_id_val = int(TELEGRAM_API_ID) if TELEGRAM_API_ID.isdigit() else TELEGRAM_API_ID
             kwargs = {"name": TELEGRAM_SESSION, "api_id": api_id_val, "api_hash": TELEGRAM_API_HASH}
             if TELEGRAM_SESSION_STRING:
-                kwargs["session_string"] = TELEGRAM_SESSION_STRING
-            self.client = Client(**kwargs)
+                kwargs["session_string"] = TELEGRAM_SESSION_STRING  # user session via string
+            self.client = Client(**kwargs)  # user mode; no bot_token
             await self.client.start()
             self.enabled = True
-            log.info("Telegram client started")
+            log.info("Telegram user session started")
             if self.index_channel:
                 await self.index_channel_files(self.index_channel)
         except Exception as e:
-            log.error(f"Telegram startup failed: {e}")
+            log.error(f"Telegram start failed: {e}")
             self.enabled = False
 
     async def stop(self):
@@ -345,19 +332,19 @@ class TelegramManager:
         try:
             last_id = index_store.last_msg_id(channel_username)
             processed = 0
-            # Newest first; stop when we reach already indexed boundary
+            # Newest first; stop when reaching last indexed
             async for msg in self.client.get_chat_history(channel_username):
                 if last_id and int(msg.id) <= last_id:
                     break
                 index_store.upsert_from_message(channel_username, msg)
                 processed += 1
                 if processed % 100 == 0:
-                    log.info(f"Indexed {processed} new messages for {channel_username}")
+                    log.info(f"Indexed {processed} new messages in {channel_username}")
                 await asyncio.sleep(0.05)
             if processed:
-                log.info(f"Indexed {processed} new items for {channel_username}")
+                log.info(f"Indexed {processed} new messages in {channel_username}")
         except FloodWait as e:
-            log.warning(f"FloodWait: sleeping {e.value}s")
+            log.warning(f"FloodWait {e.value}s; retrying")
             await asyncio.sleep(e.value)
             await self.index_channel_files(channel_username)
         except Exception as e:
@@ -369,7 +356,7 @@ class TelegramManager:
     async def search(self, q: str) -> List[Dict[str, Any]]:
         return index_store.search(q)
 
-# ---------- Models ----------
+# ---------------- Models ----------------
 class VideoResponse(BaseModel):
     statusCode: int
     url: str
@@ -385,7 +372,7 @@ class SearchResponse(BaseModel):
     results: List[Dict[str, Any]]
     total: int
 
-# ---------- Utilities ----------
+# ---------------- Utilities ----------------
 rate_limiter = RateLimiter(RATE_MAX, RATE_WIN)
 headers_mgr = HeaderManager()
 proxy_mgr = ProxyManager()
@@ -422,54 +409,53 @@ async def proxy_stream_media(
 
     proxy = proxy_mgr.pick()
     client_kwargs = {
-        "timeout": httpx.Timeout(60.0),
+        "timeout": httpx.Timeout(60.0),  # default applies to connect/read/write/pool
         "headers": vid_headers,
         "follow_redirects": True
     }
     if proxy:
         client_kwargs["proxy"] = proxy
 
-    # Single stream: open upstream to get headers and then yield bytes
     client = httpx.AsyncClient(**client_kwargs)
     try:
-        response = await client.stream("GET", upstream_url)
-        if response.status_code not in (200, 206):
-            await response.aclose()
+        resp = await client.stream("GET", upstream_url)
+        if resp.status_code not in (200, 206):
+            await resp.aclose()
             await client.aclose()
-            raise HTTPException(status_code=response.status_code, detail="Upstream unavailable")
+            raise HTTPException(status_code=resp.status_code, detail="Upstream unavailable")
 
-        # Build downstream headers from upstream headers
-        response_headers = {"Accept-Ranges": "bytes"}
-        if "Content-Length" in response.headers:
-            response_headers["Content-Length"] = response.headers["Content-Length"]
-        if "Content-Range" in response.headers:
-            response_headers["Content-Range"] = response.headers["Content-Range"]
-        status_code = 206 if response.status_code == 206 else 200
+        # Propagate headers
+        out_headers = {"Accept-Ranges": "bytes"}
+        if "Content-Length" in resp.headers:
+            out_headers["Content-Length"] = resp.headers["Content-Length"]
+        if "Content-Range" in resp.headers:
+            out_headers["Content-Range"] = resp.headers["Content-Range"]
+        status_code = 206 if resp.status_code == 206 else 200
 
-        media_type = response.headers.get("Content-Type", get_media_type(ext))
+        media_type = resp.headers.get("Content-Type", get_media_type(ext))
         if force_download:
             fname = filename or sanitize_filename("download", ext)
-            response_headers.update(headers_mgr.download_headers(fname))
+            out_headers.update(headers_mgr.download_headers(fname))
             media_type = "application/octet-stream"
 
         async def gen():
             try:
-                async for chunk in response.aiter_bytes(chunk_size=8192):
+                async for chunk in resp.aiter_bytes(8192):
                     yield chunk
             finally:
-                await response.aclose()
+                await resp.aclose()
                 await client.aclose()
 
-        return StreamingResponse(gen(), media_type=media_type, headers=response_headers, status_code=status_code)
+        return StreamingResponse(gen(), media_type=media_type, headers=out_headers, status_code=status_code)
     except Exception as e:
         try:
             await client.aclose()
         except Exception:
             pass
-        log.error(f"Stream setup error: {e}")
+        log.error(f"Stream error: {e}")
         raise HTTPException(status_code=500, detail="Media stream unavailable")
 
-# ---------- Lifespan ----------
+# ---------------- Lifespan ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -483,15 +469,15 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
-# ---------- Middleware ----------
+# ---------------- Middleware ----------------
 @app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
+async def rate_limit_mw(request: Request, call_next):
     ip = request.client.host if request.client else "0.0.0.0"
     if not rate_limiter.allow(ip):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     return await call_next(request)
 
-# ---------- Endpoints ----------
+# ---------------- Endpoints ----------------
 @app.get("/")
 async def root():
     return {
@@ -521,7 +507,6 @@ async def extract(url: Optional[str] = None, video_id: Optional[str] = None):
     if not vid:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL or video_id")
 
-    # Telegram priority via JSON index
     tglink = await tg_mgr.get_link(vid)
     if tglink:
         meta = index_store.get_meta(vid)
@@ -550,28 +535,28 @@ async def get_formats(url: Optional[str] = None, video_id: Optional[str] = None)
     if not inp:
         raise HTTPException(status_code=400, detail="Provide url or video_id")
     data = await yt_api.get_info(inp)
-    organized = {"video": {}, "audio": [], "combined": []}
-    for media in data.get("medias", []):
+    org = {"video": {}, "audio": [], "combined": []}
+    for m in data.get("medias", []):
         info = {
-            "formatId": media.get("formatId"),
-            "ext": media.get("ext"),
-            "quality": media.get("quality"),
-            "bitrate": media.get("bitrate"),
-            "stream_url": f"/stream/{data['video_id']}?format_id={media.get('formatId')}",
-            "download_url": f"/download/{data['video_id']}/{media.get('formatId')}"
+            "formatId": m.get("formatId"),
+            "ext": m.get("ext"),
+            "quality": m.get("quality"),
+            "bitrate": m.get("bitrate"),
+            "stream_url": f"/stream/{data['video_id']}?format_id={m.get('formatId')}",
+            "download_url": f"/download/{data['video_id']}/{m.get('formatId')}"
         }
-        if media.get("is_audio"):
-            organized["audio"].append(info)
-        elif media.get("type") == "video":
-            label = media.get("label", "unknown")
-            organized["video"].setdefault(label, []).append(info)
+        if m.get("is_audio"):
+            org["audio"].append(info)
+        elif m.get("type") == "video":
+            label = m.get("label", "unknown")
+            org["video"].setdefault(label, []).append(info)
         else:
-            organized["combined"].append(info)
+            org["combined"].append(info)
     return {
         "video_id": data.get("video_id"),
         "title": data.get("title"),
         "telegram_link": await tg_mgr.get_link(data.get("video_id")),
-        "formats": organized
+        "formats": org
     }
 
 @app.get("/stream/{video_id}")
@@ -600,12 +585,13 @@ async def stream_video(
         if not cands:
             cands = [m for m in medias if quality.lower() in m.get("label", "").lower()]
         chosen = cands[0] if cands else None
+
     if not chosen:
         raise HTTPException(status_code=404, detail=f"No suitable format found for {quality} {format_type}")
+
     ext = chosen.get("ext", "mp4")
-    title = data.get("title", video_id)
-    filename = sanitize_filename(f"{title}_{video_id}", ext)
-    return await proxy_stream_media(request, chosen["url"], ext, filename, force_download=bool(download))
+    name = sanitize_filename(f"{data.get('title', video_id)}_{video_id}", ext)
+    return await proxy_stream_media(request, chosen["url"], ext, name, force_download=bool(download))
 
 @app.get("/download/{video_id}/{format_id}")
 async def download_video(
@@ -617,6 +603,7 @@ async def download_video(
     tglink = await tg_mgr.get_link(video_id)
     if tglink:
         return RedirectResponse(url=tglink)
+
     data = await yt_api.get_info(video_id)
     chosen = next((m for m in data.get("medias", []) if m.get("formatId") == format_id), None)
     if not chosen:
@@ -626,16 +613,16 @@ async def download_video(
     return await proxy_stream_media(request, chosen["url"], ext, name, force_download=True)
 
 @app.get("/telegram/{video_id}")
-async def get_telegram_link(video_id: str):
+async def telegram_link(video_id: str):
     link = await tg_mgr.get_link(video_id)
     if not link:
-        raise HTTPException(status_code=404, detail="Video not found in Telegram index")
+        raise HTTPException(status_code=404, detail="Not found in Telegram index")
     return {"video_id": video_id, "telegram_url": link}
 
 @app.get("/search", response_model=SearchResponse)
-async def search_files(q: str = Query(..., description="Search query")):
-    results = await tg_mgr.search(q)
-    return SearchResponse(results=results, total=len(results))
+async def search(q: str = Query(..., description="Search query")):
+    rows = await tg_mgr.search(q)
+    return SearchResponse(results=rows, total=len(rows))
 
 @app.post("/index-new")
 async def index_new(channel: Optional[str] = Query(None, description="Channel username")):
